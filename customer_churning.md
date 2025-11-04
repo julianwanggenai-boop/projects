@@ -313,3 +313,261 @@ This MLOps framework combines the best of modern cloud ML tooling:
 
 The result is a production-grade, scalable, and automated **Customer Churn Prediction System** that aligns with enterprise MLOps standards for performance, governance, and compliance.
 
+
+----
+
+
+Below are **two complete training scripts** that integrate with **AWS SageMaker**, **MLflow**, and **ONNX** — one written in **PyTorch**, and one in **TensorFlow**.
+
+Each shows:
+
+* Data loading from S3
+* Model definition
+* Training and evaluation
+* MLflow tracking
+* Model saving (and optional ONNX export)
+
+---
+
+## 🔹 `train_pytorch.py`
+
+This script trains a simple churn prediction model in **PyTorch**, designed to run inside SageMaker’s managed training container.
+
+```python
+# train_pytorch.py
+
+import os
+import argparse
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import mlflow
+import mlflow.pytorch
+import boto3
+import io
+
+# --------------------------
+# Dataset
+# --------------------------
+class ChurnDataset(Dataset):
+    def __init__(self, csv_path):
+        df = pd.read_parquet(csv_path)
+        self.X = torch.tensor(df.drop("churn", axis=1).values, dtype=torch.float32)
+        self.y = torch.tensor(df["churn"].values, dtype=torch.float32).view(-1, 1)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+# --------------------------
+# Model Definition
+# --------------------------
+class ChurnModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# --------------------------
+# Training Loop
+# --------------------------
+def train(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    for X_batch, y_batch in dataloader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for X_batch, y_batch in dataloader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            preds = (model(X_batch) > 0.5).float()
+            correct += (preds == y_batch).sum().item()
+            total += y_batch.size(0)
+    return correct / total
+
+
+# --------------------------
+# Main Entry Point
+# --------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--train", type=str, default="/opt/ml/input/data/train")
+    parser.add_argument("--model-dir", type=str, default="/opt/ml/model")
+    args = parser.parse_args()
+
+    # MLflow setup
+    mlflow.set_tracking_uri("http://mlflow.pepsico.internal")
+    mlflow.set_experiment("ChurnPrediction-PyTorch")
+
+    # Load data
+    dataset = ChurnDataset(args.train)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=64)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ChurnModel(input_dim=dataset.X.shape[1]).to(device)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # Train and evaluate
+    with mlflow.start_run():
+        for epoch in range(args.epochs):
+            loss = train(model, train_loader, criterion, optimizer, device)
+            acc = evaluate(model, val_loader, device)
+            mlflow.log_metric("loss", loss, step=epoch)
+            mlflow.log_metric("accuracy", acc, step=epoch)
+            print(f"Epoch {epoch+1}/{args.epochs}, Loss={loss:.4f}, Accuracy={acc:.4f}")
+
+        # Save model to SageMaker model dir
+        model_path = os.path.join(args.model_dir, "model.pth")
+        torch.save(model.state_dict(), model_path)
+
+        # Log model in MLflow
+        mlflow.pytorch.log_model(model, "model")
+
+        # Export to ONNX for optimized inference
+        dummy_input = torch.randn(1, dataset.X.shape[1])
+        onnx_path = os.path.join(args.model_dir, "model.onnx")
+        torch.onnx.export(model, dummy_input, onnx_path, input_names=["input"], output_names=["output"])
+```
+
+### How the techs are used:
+
+* **PyTorch** → Defines model and training loop.
+* **MLflow** → Logs metrics and saves model versions.
+* **ONNX** → Converts PyTorch model for faster inference.
+* **SageMaker** → Runs this script on managed GPU/CPU instances automatically.
+
+---
+
+## 🔹 `train_tf.py`
+
+This TensorFlow version trains a similar feed-forward model with Keras and logs to MLflow.
+
+```python
+# train_tf.py
+
+import os
+import argparse
+import pandas as pd
+import tensorflow as tf
+import mlflow
+import mlflow.tensorflow
+from sklearn.model_selection import train_test_split
+
+def load_data(path):
+    df = pd.read_parquet(path)
+    X = df.drop("churn", axis=1).values
+    y = df["churn"].values
+    return train_test_split(X, y, test_size=0.2, random_state=42)
+
+def build_model(input_dim):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Dense(128, activation="relu", input_shape=(input_dim,)),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.Dense(64, activation="relu"),
+        tf.keras.layers.Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--train", type=str, default="/opt/ml/input/data/train")
+    parser.add_argument("--model-dir", type=str, default="/opt/ml/model")
+    args = parser.parse_args()
+
+    # MLflow setup
+    mlflow.set_tracking_uri("http://mlflow.pepsico.internal")
+    mlflow.set_experiment("ChurnPrediction-TensorFlow")
+
+    X_train, X_val, y_train, y_val = load_data(args.train)
+
+    model = build_model(input_dim=X_train.shape[1])
+
+    with mlflow.start_run():
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            verbose=2
+        )
+
+        # Log metrics
+        for epoch, acc in enumerate(history.history["val_accuracy"]):
+            mlflow.log_metric("val_accuracy", acc, step=epoch)
+
+        # Save and log model
+        model.save(os.path.join(args.model_dir, "tf_model"))
+        mlflow.tensorflow.log_model(model, "model")
+
+        # Optionally export to ONNX
+        try:
+            import tf2onnx
+            import onnx
+            spec = (tf.TensorSpec((None, X_train.shape[1]), tf.float32, name="input"),)
+            model_proto, _ = tf2onnx.convert.from_keras(model, input_signature=spec, opset=13)
+            with open(os.path.join(args.model_dir, "model.onnx"), "wb") as f:
+                f.write(model_proto.SerializeToString())
+        except ImportError:
+            print("Skipping ONNX export (install tf2onnx to enable).")
+```
+
+### How the techs are used:
+
+* **TensorFlow/Keras** → Builds and trains deep neural networks.
+* **MLflow** → Logs performance metrics and model artifacts.
+* **ONNX (optional)** → Converts TensorFlow model for cross-platform deployment.
+* **SageMaker** → Automatically picks this script as the training entry point.
+
+---
+
+## 🔹 Summary of Integration
+
+| Component                       | Purpose                          | Where It Appears                        |
+| ------------------------------- | -------------------------------- | --------------------------------------- |
+| **SageMaker**                   | Executes training at scale       | `train_model.py` and script entrypoints |
+| **PyTorch / TensorFlow**        | ML frameworks for modeling       | `train_pytorch.py`, `train_tf.py`       |
+| **MLflow**                      | Experiment tracking              | Both scripts                            |
+| **ONNX**                        | Model optimization for inference | Both scripts                            |
+| **S3 (via SageMaker channels)** | Data and model storage           | `--train` and `--model-dir` args        |
+
+
+
+
