@@ -568,6 +568,216 @@ if __name__ == "__main__":
 | **ONNX**                        | Model optimization for inference | Both scripts                            |
 | **S3 (via SageMaker channels)** | Data and model storage           | `--train` and `--model-dir` args        |
 
+---
+
+Below are production-ready examples of `deployment.yaml` and `service.yaml` files. They assume that the **Docker image** (from your training and inference build) has already been pushed to **Amazon ECR**.
+
+
+## 📂 Directory Structure Context
+
+Your deployment directory will typically look like this:
+
+```
+churn-mlops/
+│
+├── Dockerfile
+├── serve.py
+├── requirements.txt
+├── k8s/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── hpa.yaml (optional)
+```
+
+---
+
+## ⚙️ 1. `k8s/deployment.yaml`
+
+This defines how your containerized churn prediction service runs inside Kubernetes.
+It sets resource limits, environment variables, and points to your **ONNX inference image**.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: churn-model-deployment
+  namespace: mlops
+  labels:
+    app: churn-model
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: churn-model
+  template:
+    metadata:
+      labels:
+        app: churn-model
+    spec:
+      containers:
+        - name: churn-model
+          image: <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/churn-model:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MODEL_PATH
+              value: "/app/model.onnx"
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: LOG_LEVEL
+              value: "INFO"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      imagePullSecrets:
+        - name: ecr-secret
+```
+
+### 🔍 Key Points
+
+| Element                | Description                               |
+| ---------------------- | ----------------------------------------- |
+| **replicas: 3**        | Runs three pods for high availability     |
+| **image:**             | Replace with your ECR image URI           |
+| **env vars**           | Configure model path and AWS region       |
+| **probes**             | `/health` endpoint ensures healthy pods   |
+| **resources**          | Limits CPU/memory for predictable scaling |
+| **namespace:** `mlops` | Logical grouping for MLOps workloads      |
+
+You can create the ECR secret (so K8s can pull your Docker image) using:
+
+```bash
+aws ecr get-login-password --region us-east-1 | \
+kubectl create secret docker-registry ecr-secret \
+  --docker-server=<aws_account_id>.dkr.ecr.us-east-1.amazonaws.com \
+  --docker-username=AWS \
+  --docker-password-stdin
+```
+
+---
+
+## 🌐 2. `k8s/service.yaml`
+
+This exposes the churn model service to other components — internal (ClusterIP) or external (LoadBalancer).
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: churn-model-service
+  namespace: mlops
+  labels:
+    app: churn-model
+spec:
+  selector:
+    app: churn-model
+  type: LoadBalancer
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+```
+
+### 🔍 Key Points
+
+| Element                       | Description                                                   |
+| ----------------------------- | ------------------------------------------------------------- |
+| **type: LoadBalancer**        | Exposes the model externally (creates AWS ELB automatically)  |
+| **port 80 → targetPort 8080** | Routes public traffic to FastAPI running inside the container |
+| **selector**                  | Matches labels from `deployment.yaml` to connect pods         |
+
+You can deploy both manifests with:
+
+```bash
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+```
+
+Then check the service endpoint:
+
+```bash
+kubectl get svc -n mlops
+```
+
+It will show something like:
+
+```
+NAME                  TYPE           CLUSTER-IP      EXTERNAL-IP        PORT(S)        AGE
+churn-model-service   LoadBalancer   10.0.215.77     a1b2c3d4.elb.aws   80:30001/TCP   2m
+```
+
+You can then send requests:
+
+```bash
+curl -X POST http://a1b2c3d4.elb.aws/predict \
+  -H "Content-Type: application/json" \
+  -d '{"data": [0.5, 1.0, 23.1, 5, 0, 1]}'
+```
+
+---
+
+## 🧠 Optional: Auto-Scaling (Horizontal Pod Autoscaler)
+
+If you want your model to **scale automatically** based on CPU or memory load, you can include this `hpa.yaml`:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: churn-model-hpa
+  namespace: mlops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: churn-model-deployment
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+Apply it with:
+
+```bash
+kubectl apply -f k8s/hpa.yaml
+```
+
+---
+
+## 🚀 How These Fit the MLOps System
+
+| Component         | Role                           | Tech Used                        |
+| ----------------- | ------------------------------ | -------------------------------- |
+| `Dockerfile`      | Packages model into container  | **Docker**                       |
+| `serve.py`        | REST API inference service     | **FastAPI + ONNX Runtime**       |
+| `deployment.yaml` | Defines pod specs & probes     | **Kubernetes (EKS)**             |
+| `service.yaml`    | Exposes API endpoint           | **EKS LoadBalancer**             |
+| `hpa.yaml`        | Auto-scales pods               | **Kubernetes Autoscaler**        |
+| **CloudWatch**    | Monitors logs, latency metrics | Integrated via AWS logging agent |
 
 
 
