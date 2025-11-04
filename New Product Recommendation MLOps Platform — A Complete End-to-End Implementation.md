@@ -320,3 +320,374 @@ Real-time metrics like latency, throughput, and AUROC drift are visualized via *
 
 The **PepsiCo New Product Recommendation MLOps Platform** demonstrates how large-scale consumer data and enterprise-grade MLOps tooling can be integrated into a **reliable, scalable, and monitored AI system**.
 From **data pipelines** to **model deployment**, this architecture delivers **real-time insights** that empower PepsiCo’s regional marketing teams to launch the right products, at the right time, for the right customers.
+
+---
+
+Below I add a complete **Terraform** implementation and the operational steps you need to provision the cloud pieces used in the blog: Resource Group, Storage (for remote state), Container Registry (ACR), AKS cluster, Azure ML Workspace, Key Vault, Application Insights, and role assignments so AKS can pull from ACR. I also include **backend config**, **variables**, **outputs**, a short **bootstrap** note (to create the backend storage if you don't already have it), and an example **GitHub Actions** workflow to run Terraform in CI.
+
+> Files included: `versions.tf`, `providers.tf`, `backend.tf`, `variables.tf`, `main.tf`, `outputs.tf`, plus commands and CI examples.
+
+---
+
+# 1) `versions.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.4.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+```
+
+# 2) `providers.tf`
+
+```hcl
+provider "azurerm" {
+  features {}
+
+  # Auth via environment variables in CI/local:
+  # ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+}
+```
+
+# 3) `backend.tf` (Azure Blob remote state)
+
+```hcl
+terraform {
+  backend "azurerm" {
+    resource_group_name   = "tfstate-rg"             # replace if created elsewhere
+    storage_account_name  = "tfstatestorage<suffix>" # lower-case globally unique
+    container_name        = "tfstate"
+    key                   = "pepsico-recommendation.terraform.tfstate"
+  }
+}
+```
+
+**Note:** If you don't already have the storage account + container for backend, see bootstrapping steps below.
+
+# 4) `variables.tf`
+
+```hcl
+variable "location" {
+  type    = string
+  default = "eastus"
+}
+
+variable "prefix" {
+  type    = string
+  default = "pepsico-reco"
+}
+
+variable "subscription_id" {
+  type = string
+  default = "" # set via env or terraform.tfvars
+}
+
+variable "aks_node_count" {
+  type    = number
+  default = 3
+}
+
+variable "aks_node_size" {
+  type    = string
+  default = "Standard_DS3_v2"
+}
+
+variable "acr_sku" {
+  type    = string
+  default = "Standard"
+}
+```
+
+# 5) `main.tf` (core infra)
+
+```hcl
+locals {
+  name_rg     = "${var.prefix}-rg"
+  name_acr    = "${var.prefix}acr"
+  name_aks    = "${var.prefix}-aks"
+  name_kv     = "${var.prefix}-kv"
+  name_sa     = "${var.prefix}sa"
+  name_ai     = "${var.prefix}-ai"
+  name_aml    = "${var.prefix}-aml"
+  dns_prefix  = "${var.prefix}-dns"
+}
+
+resource "azurerm_resource_group" "rg" {
+  name     = local.name_rg
+  location = var.location
+  tags = { project = "pepsico-reco" }
+}
+
+# Container Registry
+resource "azurerm_container_registry" "acr" {
+  name                = local.name_acr
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  sku                 = var.acr_sku
+  admin_enabled       = false
+}
+
+# AKS with system-assigned identity
+resource "azurerm_kubernetes_cluster" "aks" {
+  name                = local.name_aks
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  dns_prefix          = local.dns_prefix
+
+  default_node_pool {
+    name       = "agentpool"
+    node_count = var.aks_node_count
+    vm_size    = var.aks_node_size
+  }
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  network_profile {
+    network_plugin = "azure"
+  }
+
+  tags = { project = "pepsico-reco" }
+}
+
+# Assign AcrPull role so AKS can pull images from ACR
+resource "azurerm_role_assignment" "acr_pull" {
+  scope                = azurerm_container_registry.acr.id
+  role_definition_name = "AcrPull"
+  principal_id         = azurerm_kubernetes_cluster.aks.kubelet_identity[0].object_id
+}
+
+# Storage Account for model/data (optional; for AML or state if not using backend)
+resource "azurerm_storage_account" "sa" {
+  name                     = lower(local.name_sa)
+  resource_group_name      = azurerm_resource_group.rg.name
+  location                 = azurerm_resource_group.rg.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+}
+
+# Key Vault (store secrets, e.g., storage connection strings)
+resource "azurerm_key_vault" "kv" {
+  name                        = local.name_kv
+  location                    = azurerm_resource_group.rg.location
+  resource_group_name         = azurerm_resource_group.rg.name
+  tenant_id                   = data.azurerm_client_config.current.tenant_id
+  sku_name                    = "standard"
+  purge_protection_enabled    = false
+  soft_delete_retention_days  = 7
+  access_policy {
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = data.azurerm_client_config.current.object_id
+    secret_permissions = ["get","list","set","delete"]
+  }
+}
+
+# Application Insights (monitoring for endpoints)
+resource "azurerm_application_insights" "ai" {
+  name                = local.name_ai
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  application_type    = "web"
+}
+
+# Azure ML Workspace
+resource "azurerm_machine_learning_workspace" "mlw" {
+  name                = local.name_aml
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  friendly_name       = "PepsiCo Recommendation Workspace"
+  sku_name            = "Basic"
+  storage_account_id  = azurerm_storage_account.sa.id
+  application_insights_id = azurerm_application_insights.ai.id
+  key_vault_id           = azurerm_key_vault.kv.id
+}
+
+# Optional random id for uniqueness
+resource "random_pet" "name" {
+  length = 2
+}
+```
+
+# 6) `outputs.tf`
+
+```hcl
+output "resource_group" {
+  value = azurerm_resource_group.rg.name
+}
+
+output "acr_login_server" {
+  value = azurerm_container_registry.acr.login_server
+}
+
+output "aks_cluster_name" {
+  value = azurerm_kubernetes_cluster.aks.name
+}
+
+output "aks_kube_config" {
+  description = "Use az aks get-credentials to fetch kubeconfig"
+  value       = azurerm_kubernetes_cluster.aks.kube_admin_config_raw
+  sensitive   = true
+}
+
+output "ml_workspace_name" {
+  value = azurerm_machine_learning_workspace.mlw.name
+}
+```
+
+# 7) Bootstrapping the remote state backend (if needed)
+
+If you don't already have the `tfstate` storage account & container used by `backend.tf`, create them once (manually or with a tiny bootstrap script). Example (az cli):
+
+```bash
+# Variables
+AZ_RG="tfstate-rg"
+AZ_SA="tfstatestorage<suffix>"
+AZ_CON="tfstate"
+
+az group create -n $AZ_RG -l eastus
+az storage account create -n $AZ_SA -g $AZ_RG -l eastus --sku Standard_LRS
+ST_KEY=$(az storage account keys list -g $AZ_RG -n $AZ_SA --query "[0].value" -o tsv)
+az storage container create -n $AZ_CON --account-name $AZ_SA --account-key $ST_KEY
+```
+
+Then `terraform init` will use that backend.
+
+# 8) Terraform operations (local / manual / CI command examples)
+
+Assuming you export Azure creds (service principal) as env vars:
+
+```bash
+export ARM_CLIENT_ID="xxxx"
+export ARM_CLIENT_SECRET="xxxx"
+export ARM_TENANT_ID="xxxx"
+export ARM_SUBSCRIPTION_ID="xxxx"
+
+# initialize
+terraform init
+
+# validate
+terraform validate
+
+# plan
+terraform plan -var="location=eastus" -out plan.tfplan
+
+# apply
+terraform apply "plan.tfplan"
+
+# or directly
+terraform apply -auto-approve -var="location=eastus"
+
+# destroy (teardown)
+terraform destroy -auto-approve -var="location=eastus"
+```
+
+# 9) Creating the Azure Service Principal (for CI) and storing in GitHub secrets
+
+Create a SP with `Contributor` (or limited) role scoped to subscription or RG:
+
+```bash
+az ad sp create-for-rbac --name "pepsico-tf-ci" \
+  --role Contributor \
+  --scopes /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP> \
+  --sdk-auth
+```
+
+This returns a JSON blob you can save as `AZURE_CREDENTIALS` (used by GitHub Actions `azure/login`). In GitHub repo Secrets create `AZURE_CREDENTIALS`.
+
+# 10) Example GitHub Actions workflow to run Terraform and deploy infra
+
+Create `.github/workflows/terraform.yml`:
+
+```yaml
+name: "Terraform - Plan & Apply"
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.4.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: tfplan
+        run: terraform plan -out tfplan -input=false
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -input=false -auto-approve tfplan
+```
+
+> Put sensitive values and overrides in GitHub secrets. Do not commit client secrets to the repo.
+
+# 11) Post-deploy AKS kubeconfig & ACR login (CI step example)
+
+After Terraform creates AKS & ACR, you might want a CI job to build and push container images and deploy k8s manifests:
+
+```yaml
+- name: Azure CLI Login
+  uses: azure/CLI@v1
+  with:
+    azcliversion: 2.50.0
+    inlineScript: |
+      az aks get-credentials --resource-group $RG --name $AKS_NAME --overwrite-existing
+
+- name: Build and Push Image
+  run: |
+    docker build -t $ACR_LOGIN_SERVER/recommendation:latest .
+    echo "${{ secrets.ACR_PASSWORD }}" | docker login $ACR_LOGIN_SERVER -u $ACR_USERNAME --password-stdin
+    docker push $ACR_LOGIN_SERVER/recommendation:latest
+
+- name: Deploy to AKS
+  run: kubectl apply -f k8s/deployment.yaml
+```
+
+(You can automate ACR login with `az acr login --name <acr>` instead of docker login.)
+
+# 12) Security & Best Practices
+
+* **Remote state**: use Azure Blob backend for state plus role-based access; enable soft-delete/purge protection on Key Vault when appropriate.
+* **State locking**: azurerm backend supports locking via storage lease.
+* **Least privilege SP**: prefer scoped role assignments to the resource group rather than subscription-wide Contributor.
+* **Secrets**: never store secrets in Terraform files; store in Key Vault and reference via `azurerm_key_vault_secret` or inject from CI secrets.
+* **Immutable infra**: prefer changing node pool sizes and scaling via Terraform (or cluster autoscaler) and avoid manual edits that drift.
+* **Plan approval**: require PR / manual approval before `terraform apply` on `main`.
+
+# 13) How this ties to your MLOps platform
+
+* Terraform provisions **AKS** to host Dockerized model servers (the Flask/Torch serve image), **ACR** to store images, and an **Azure ML Workspace** for training orchestration.
+* The `azurerm_key_vault` stores secrets and connection strings for Azure Data Lake / Storage used by your Airflow / PySpark steps.
+* Use outputs (e.g., `acr_login_server`) in your CI workflow to push images and in deployment manifests to reference images.
+
