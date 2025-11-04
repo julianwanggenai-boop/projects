@@ -780,4 +780,203 @@ kubectl apply -f k8s/hpa.yaml
 | **CloudWatch**    | Monitors logs, latency metrics | Integrated via AWS logging agent |
 
 
+---
+
+Let’s go through several **common binary classification loss functions**, explain **how they work**, and when to use each.
+
+
+## 1. **Binary Cross-Entropy (Log Loss)**
+
+**Most common** for binary classification — used in models like logistic regression, neural networks, etc.
+
+### Formula
+
+For each sample:
+[
+L = -[y \log(p) + (1 - y) \log(1 - p)]
+]
+where:
+
+* ( y \in {0, 1} ) — true label
+* ( p \in [0, 1] ) — predicted probability that the sample belongs to class 1
+
+Average it over all samples:
+[
+\text{Loss} = \frac{1}{N} \sum_{i=1}^{N} L_i
+]
+
+### Intuition
+
+* If ( y = 1 ) and ( p ) is close to 1 → loss is small.
+* If ( y = 1 ) and ( p ) is close to 0 → loss is large.
+* Same idea symmetrically when ( y = 0 ).
+* It heavily penalizes **confident wrong predictions**.
+
+### In Code
+
+**PyTorch**
+
+```python
+criterion = torch.nn.BCELoss()
+# if model outputs logits:
+criterion = torch.nn.BCEWithLogitsLoss()
+```
+
+**TensorFlow/Keras**
+
+```python
+model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+```
+
+### When to use
+
+* Default for **binary classification** when your model outputs probabilities (via sigmoid).
+
+---
+
+## 2. **BCE with Logits (Numerically Stable BCE)**
+
+This is a more stable version of binary cross-entropy.
+
+If your model outputs raw logits ( z ) (before the sigmoid), then:
+[
+p = \sigma(z) = \frac{1}{1 + e^{-z}}
+]
+Instead of explicitly computing sigmoid and then BCE, `BCEWithLogitsLoss` combines both in one step to prevent **overflow/underflow** errors.
+
+### Formula (simplified)
+
+[
+L = \max(z, 0) - z \cdot y + \log(1 + e^{-|z|})
+]
+
+### Why it’s better
+
+* Avoids `log(0)` or very small probability errors.
+* Preferred in practice for neural networks.
+
+---
+
+## 3. **Hinge Loss (used in SVMs)**
+
+Used when outputs are **class scores**, not probabilities.
+
+### Formula
+
+[
+L = \max(0, 1 - y' \cdot f(x))
+]
+where:
+
+* ( y' \in {-1, +1} ) (note the labels are ±1)
+* ( f(x) ) is the raw model score (e.g., output before sigmoid)
+
+### Intuition
+
+* Encourages a margin between classes.
+* If prediction ( f(x) ) and true label ( y' ) have the same sign and magnitude > 1 → no loss (good prediction).
+* If inside the margin or misclassified → positive loss (penalized).
+
+### When to use
+
+* SVMs or margin-based classifiers.
+* Not probabilistic, so not ideal if you need probabilities.
+
+---
+
+## 4. **Focal Loss (for imbalanced classes)**
+
+Designed for **class imbalance**, like churn prediction (churners < non-churners).
+
+### Formula
+
+[
+L = -\alpha (1 - p)^{\gamma} y \log(p) - (1 - \alpha) p^{\gamma} (1 - y) \log(1 - p)
+]
+
+Parameters:
+
+* ( \alpha ): weighting factor for balancing classes
+* ( \gamma ): focusing parameter to reduce loss for easy examples
+
+### Intuition
+
+* Reduces the relative loss for well-classified examples (when ( p ) is near 1 for true positives).
+* Focuses training on **hard or misclassified samples**.
+
+### In Code (PyTorch)
+
+```python
+import torch
+import torch.nn.functional as F
+
+def focal_loss(inputs, targets, alpha=0.25, gamma=2):
+    bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+    pt = torch.exp(-bce_loss)
+    loss = alpha * (1 - pt) ** gamma * bce_loss
+    return loss.mean()
+```
+
+### When to use
+
+* Highly imbalanced binary datasets (e.g., fraud detection, churn, anomaly detection).
+
+---
+
+## 5. **Hamming Loss**
+
+Used less commonly, but measures the **fraction of wrong labels**.
+
+### Formula
+
+[
+L = \frac{1}{N} \sum_{i=1}^{N} \mathbb{1}(\hat{y}_i \neq y_i)
+]
+It’s not differentiable, so rarely used directly for training, but useful for evaluation.
+
+---
+
+## 6. **Custom Weighted BCE**
+
+If you have imbalanced data but don’t want to use focal loss, you can assign different class weights.
+
+### Formula
+
+[
+L = - [w_1 y \log(p) + w_0 (1 - y) \log(1 - p)]
+]
+
+### In PyTorch
+
+```python
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([5.0]))
+```
+
+### When to use
+
+* When positive class (e.g., churn) is rare and you want to penalize false negatives more heavily.
+
+---
+
+## ✅ Summary Table
+
+| Loss Function            | Type               | Typical Use Case               | Model Output        | Probabilistic? |
+| ------------------------ | ------------------ | ------------------------------ | ------------------- | -------------- |
+| **Binary Cross-Entropy** | Standard           | Balanced binary classification | Sigmoid probability | ✅              |
+| **BCEWithLogitsLoss**    | Stable BCE         | Neural nets (raw logits)       | Logits              | ✅              |
+| **Hinge Loss**           | Margin-based       | SVMs                           | Raw score           | ❌              |
+| **Focal Loss**           | Imbalanced classes | Rare event detection           | Sigmoid probability | ✅              |
+| **Weighted BCE**         | Imbalanced classes | Moderate imbalance             | Sigmoid probability | ✅              |
+
+---
+
+### In a churn prediction context:
+
+For your **PepsiCo churn prediction system**, you’ll likely use:
+
+```python
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weight]))
+```
+
+because churn is typically an **imbalanced binary classification** problem — this ensures your model pays more attention to the minority “churn” cases.
 
