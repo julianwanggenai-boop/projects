@@ -1,46 +1,43 @@
 # Building a Large-Scale Profile Search Re-Ranking System at G42
 
-Modern AI-driven platforms increasingly rely on search engines to deliver precise and personalized results. At G42, we faced a challenge: our user-profile search engine had an **average precision of less than 1%**. To tackle this, we designed and implemented a **large-scale machine learning–based re-ranking system** that boosted precision to **87%**, leveraging a combination of AWS SageMaker, PyTorch, ONNX, Airflow, and CI/CD automation. Here’s a detailed walkthrough of the project, covering each component, implementation action, and outcome.
+Modern AI platforms rely on search engines for precise, personalized results. At G42, our user-profile search engine had an **average precision of <1%**. To address this, we built a **large-scale ML-based re-ranking system** that increased precision to **87%**, using **AWS SageMaker, EKS, PyTorch, ONNX, Airflow, Kinesis, Terraform, Docker, CI/CD, MLflow, and CloudWatch**. Here’s a full technical walkthrough.
 
 ---
 
 ## 1. Architecture Overview
 
-Our system is composed of several key layers:
+Key layers:
 
-1. **Data ingestion and ETL pipelines** – to process raw user-profile data in batch and streaming modes.
-2. **Feature computation** – scalable feature extraction using PySpark and Kinesis.
-3. **Model training and optimization** – distributed PyTorch models with ONNX export for low-latency inference.
-4. **Deployment and orchestration** – via Docker, EKS, Terraform, and CI/CD pipelines.
-5. **Monitoring and observability** – using MLflow and CloudWatch.
+1. **Data ingestion & ETL pipelines** – batch & streaming (PySpark, Kinesis).
+2. **Feature computation** – scalable extraction for training & real-time inference.
+3. **Model training & optimization** – distributed PyTorch + ONNX.
+4. **Deployment & orchestration** – Docker, EKS, Terraform, CI/CD.
+5. **Monitoring & observability** – MLflow + CloudWatch.
 
-The high-level flow looks like this:
+High-level flow:
 
 ```
-User Search Query → Feature Pipelines (PySpark + Kinesis) → ML Re-Ranker (PyTorch + ONNX) → Re-Ranked Results → User
+User Query → Feature Pipelines (PySpark + Kinesis) → ML Re-Ranker (PyTorch + ONNX) → Re-Ranked Results → User
 ```
 
 ---
 
-## 2. Scalable ETL and Feature Pipelines
+## 2. Scalable ETL & Feature Pipelines
 
-We needed **dynamic, high-throughput feature computation** for millions of profiles:
+We needed **real-time and batch feature computation**:
 
-* **Batch pipeline**: PySpark jobs running on EMR to preprocess historical data.
-* **Streaming pipeline**: AWS Kinesis streams to capture real-time profile updates.
-
-Example PySpark job snippet for feature extraction:
+* **Batch (PySpark)** – precompute features on historical data.
 
 ```python
+# PySpark batch pipeline
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, udf
 from pyspark.sql.types import DoubleType
 
 spark = SparkSession.builder.appName("FeaturePipeline").getOrCreate()
 
-# Example feature: similarity score between search query and profile description
 def compute_similarity(query, profile_text):
-    return float(len(set(query.split()) & set(profile_text.split())))/len(set(query.split()))
+    return float(len(set(query.split()) & set(profile_text.split()))) / len(set(query.split()))
 
 similarity_udf = udf(compute_similarity, DoubleType())
 
@@ -53,29 +50,36 @@ features_df = features_df.withColumn("similarity_score", similarity_udf(col("que
 features_df.write.parquet("s3://g42-features/features.parquet")
 ```
 
-* **Streaming update** via Kinesis:
+* **Streaming (Kinesis)** – process updates in real time.
 
 ```python
 import boto3
 import json
 
+# Create Kinesis client
 kinesis_client = boto3.client('kinesis')
 
-def send_to_stream(profile_update):
+def send_to_kinesis(profile_update):
+    """
+    Sends profile updates to Kinesis stream for real-time feature computation
+    """
     kinesis_client.put_record(
-        StreamName="profile-updates",
+        StreamName="profile-updates-stream",
         Data=json.dumps(profile_update),
-        PartitionKey=profile_update["user_id"]
+        PartitionKey=str(profile_update["user_id"])
     )
+
+# Example usage
+send_to_kinesis({"user_id": 123, "profile_text": "AI engineer with PyTorch experience"})
 ```
 
-These pipelines fed features for both training and inference in real-time.
+* **Kinesis usage explained**: Kinesis acts as a **real-time streaming buffer**, allowing new profile updates or search queries to be immediately ingested, processed, and passed to the feature pipeline for low-latency inference.
 
 ---
 
-## 3. Model Training and ONNX Optimization
+## 3. Model Training & ONNX Optimization
 
-The core of the re-ranking engine is a **PyTorch-based neural network** trained to predict the relevance of profiles given a query.
+We trained a **PyTorch neural network** to predict profile relevance.
 
 ```python
 import torch
@@ -104,10 +108,8 @@ class ReRankerModel(nn.Module):
     def forward(self, x):
         return self.sigmoid(self.fc2(self.relu(self.fc1(x))))
 
-# Load data
 dataset = ProfileDataset(features_array, labels_array)
 dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
-
 model = ReRankerModel(input_dim=features_array.shape[1])
 criterion = nn.BCELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -122,20 +124,50 @@ for epoch in range(10):
         optimizer.step()
 ```
 
-To reduce inference latency, we exported the PyTorch model to **ONNX**:
+* **ONNX optimization** for low-latency inference:
 
 ```python
 dummy_input = torch.randn(1, features_array.shape[1])
 torch.onnx.export(model, dummy_input, "re_ranker.onnx", input_names=["input"], output_names=["output"])
 ```
 
-**Result**: ONNX inference latency dropped from ~120ms per query to <15ms per query.
+Result: **Inference latency reduced from ~120ms to <15ms per query**.
 
 ---
 
-## 4. Deployment with EKS, Docker, and CI/CD
+## 4. Deployment & Infrastructure with Terraform, Docker, and CI/CD
 
-We containerized the re-ranker using Docker:
+**Terraform** provisions all AWS infrastructure (EKS cluster, S3 buckets, Kinesis streams, CloudWatch log groups):
+
+```hcl
+provider "aws" {
+  region = "us-east-1"
+}
+
+resource "aws_kinesis_stream" "profile_updates" {
+  name        = "profile-updates-stream"
+  shard_count = 2
+}
+
+resource "aws_s3_bucket" "features_bucket" {
+  bucket = "g42-features"
+}
+
+resource "aws_cloudwatch_log_group" "re_ranker_logs" {
+  name = "/g42/re-ranker"
+  retention_in_days = 14
+}
+
+module "eks" {
+  source          = "terraform-aws-modules/eks/aws"
+  cluster_name    = "g42-re-ranker-cluster"
+  cluster_version = "1.27"
+  subnets         = ["subnet-abc", "subnet-def"]
+  vpc_id          = "vpc-123"
+}
+```
+
+* **Docker container** hosts ONNX model:
 
 ```dockerfile
 FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
@@ -145,66 +177,45 @@ WORKDIR /app
 CMD ["python", "inference.py"]
 ```
 
-**Kubernetes deployment (`k8s/deployment.yaml`)**:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: re-ranker
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: re-ranker
-  template:
-    metadata:
-      labels:
-        app: re-ranker
-    spec:
-      containers:
-      - name: re-ranker
-        image: g42/re-ranker:latest
-        ports:
-        - containerPort: 8080
-```
-
-**Service (`k8s/service.yaml`)**:
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: re-ranker-service
-spec:
-  selector:
-    app: re-ranker
-  ports:
-    - protocol: TCP
-      port: 80
-      targetPort: 8080
-  type: LoadBalancer
-```
-
-We automated deployment using **Terraform** for infrastructure provisioning and **GitHub Actions + CodePipeline** for CI/CD.
+* **Kubernetes Deployment + Service** (same as previous blog).
+* **CI/CD**: GitHub Actions triggers build → Docker image → Terraform applies → deploy to EKS.
 
 ---
 
-## 5. Model Observability and Monitoring
+## 5. Monitoring & Observability with MLflow + CloudWatch
 
-* **MLflow** tracked experiments, model versions, and metrics.
-* **AWS CloudWatch** visualized key metrics like inference latency and feature distribution drift.
-
-Example MLflow logging:
+* **MLflow** tracks experiments:
 
 ```python
 import mlflow
 mlflow.start_run()
-mlflow.log_param("lr", 0.001)
+mlflow.log_param("learning_rate", 0.001)
 mlflow.log_metric("loss", loss.item())
 mlflow.pytorch.log_model(model, "re_ranker_model")
 mlflow.end_run()
 ```
+
+* **CloudWatch** monitors:
+
+```python
+import boto3
+
+cloudwatch = boto3.client('cloudwatch')
+
+def log_metrics(latency_ms, precision):
+    cloudwatch.put_metric_data(
+        Namespace='G42/ReRanker',
+        MetricData=[
+            {'MetricName': 'InferenceLatency', 'Value': latency_ms, 'Unit': 'Milliseconds'},
+            {'MetricName': 'Precision', 'Value': precision, 'Unit': 'Percent'}
+        ]
+    )
+
+# Example
+log_metrics(latency_ms=12.3, precision=87.0)
+```
+
+CloudWatch **alerts** if latency spikes >50ms or precision drops <85%, enabling real-time monitoring and alerting.
 
 ---
 
@@ -212,20 +223,18 @@ mlflow.end_run()
 
 * **Precision improvement**: <1% → 87%
 * **Inference latency**: ~120ms → <15ms per query
-* **Scalability**: Handled millions of profiles and thousands of queries per second
-* **Automated retraining**: New model versions deployed daily via CI/CD
+* **Scalability**: millions of profiles, thousands of queries/sec
+* **Automated retraining**: daily via CI/CD pipelines
 
 ---
 
-## 7. Lessons Learned
+## 7. Key Learnings
 
-1. **ONNX optimization** drastically reduces latency in large-scale inference.
-2. **CI/CD for MLOps** ensures reproducibility and governance across multiple environments.
-3. **Streaming + batch pipelines** allow real-time responsiveness without sacrificing historical insights.
-4. **Close collaboration with data engineering teams** is crucial for designing secure and compliant high-throughput pipelines.
+1. **Kinesis** enables real-time streaming updates with low latency.
+2. **Terraform** ensures reproducible and compliant infrastructure.
+3. **CloudWatch** provides observability with metrics, dashboards, and alerts.
+4. **ONNX** drastically reduces inference time.
+5. **CI/CD + Docker + EKS** ensures consistent deployments across environments.
 
----
-
-This project demonstrates how a combination of **cloud-native MLOps, distributed feature engineering, and model optimization** can transform a low-precision search engine into a **highly precise, real-time profile re-ranking system**.
-
+This project demonstrates how **cloud-native MLOps, distributed feature engineering, and model optimization** can transform a low-precision search engine into a **highly precise, real-time profile re-ranking system**.
 
